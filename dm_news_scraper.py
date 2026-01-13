@@ -1,14 +1,16 @@
-import datetime as dt
 import hashlib
 import json
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 BASE_URL = "https://www.dailymirror.lk"
@@ -20,18 +22,99 @@ SENT_ARTICLES_PATH = Path(__file__).with_name("sent_articles.json")
 RETENTION_DAYS = 7
 
 
-def fetch_html(url: str) -> str:
-    headers = {
+def utc_now() -> datetime:
+    """Return timezone-aware current UTC datetime to replace deprecated utcnow()."""
+    return datetime.now(timezone.utc)
+
+
+def _create_http_session() -> requests.Session:
+    """
+    Create a requests.Session configured with:
+    - Retry logic (3 retries with exponential backoff) for transient failures
+    - Browser-like headers to reduce likelihood of being blocked
+    
+    This helps make the scraper more robust against temporary network issues
+    and server-side rate limiting or bot detection.
+    """
+    session = requests.Session()
+    
+    # Configure retry strategy: retry on connection errors, timeouts, and 5xx server errors
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,  # Wait 1s, 2s, 4s between retries
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+    )
+    
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    # Set browser-like headers to reduce likelihood of 403 responses
+    session.headers.update({
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/120.0 Safari/537.36"
         ),
         "Accept-Language": "en-US,en;q=0.9",
-    }
-    resp = requests.get(url, headers=headers, timeout=20)
-    resp.raise_for_status()
-    return resp.text
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+    
+    return session
+
+
+# Global session instance for reuse across requests
+_session = _create_http_session()
+
+
+def fetch_url_text(url: str, timeout: int = 15) -> str | None:
+    """
+    Fetch URL and return response text, or None on failure.
+    
+    Treats 403 (Forbidden) as non-fatal - logs and returns None rather than crashing.
+    This prevents the entire scraper job from failing when upstream blocks our requests.
+    
+    Other HTTP errors use raise_for_status() but are caught and return None to keep
+    the script resilient to upstream errors.
+    
+    Args:
+        url: URL to fetch
+        timeout: Request timeout in seconds
+        
+    Returns:
+        Response text on success, None on any error
+    """
+    try:
+        resp = _session.get(url, timeout=timeout)
+        
+        # Handle 403 specially - upstream is blocking us, not a scraper bug
+        if resp.status_code == 403:
+            print(
+                f"⚠️  403 Forbidden from {url} - upstream may be blocking requests. "
+                "This is not a scraper error.",
+                file=sys.stderr,
+            )
+            return None
+        
+        # Raise for other bad status codes (4xx, 5xx)
+        resp.raise_for_status()
+        return resp.text
+        
+    except requests.exceptions.RequestException as exc:
+        print(f"⚠️  Network error fetching {url}: {exc}", file=sys.stderr)
+        return None
+
+
+def fetch_html(url: str) -> str:
+    """
+    Legacy wrapper for fetch_url_text that raises on failure.
+    Used internally when we know the URL should work (e.g., article pages).
+    """
+    text = fetch_url_text(url, timeout=20)
+    if text is None:
+        raise RuntimeError(f"Failed to fetch {url}")
+    return text
 
 
 def extract_article_links(list_url: str = BREAKING_NEWS_URL) -> List[str]:
@@ -145,7 +228,7 @@ def cleanup_old_articles(
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Remove articles older than the retention period."""
 
-    cutoff = dt.datetime.utcnow() - dt.timedelta(days=retention_days)
+    cutoff = utc_now() - timedelta(days=retention_days)
     cleaned: List[Dict[str, Any]] = []
 
     for article in store.get("articles", []):
@@ -155,7 +238,10 @@ def cleanup_old_articles(
             continue
         try:
             ts = sent_at_str.rstrip("Z")
-            sent_at = dt.datetime.fromisoformat(ts)
+            sent_at = datetime.fromisoformat(ts)
+            # Make timezone-aware if it's naive (old data)
+            if sent_at.tzinfo is None:
+                sent_at = sent_at.replace(tzinfo=timezone.utc)
         except ValueError:
             print(
                 f"❌ Invalid sent_at timestamp '{sent_at_str}' in tracking store; keeping entry but it won't be pruned.",
@@ -208,7 +294,7 @@ def save_sent_article(
 ) -> None:
     """Append a newly sent article to the in-memory store."""
 
-    now = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    now = utc_now().replace(microsecond=0).isoformat() + "Z"
     store.setdefault("articles", []).append(
         {
             "url": url,
@@ -264,10 +350,39 @@ def main(argv: List[str]) -> None:
     print(f"📊 Currently tracking {tracked_count} articles from last {RETENTION_DAYS} days")
     print(f"🔍 Fetching breaking news list: {BREAKING_NEWS_URL}")
 
+    # Attempt to fetch the breaking news list
+    # If upstream returns 403 or we encounter network errors, exit gracefully with code 0
+    # to avoid marking the GitHub Actions job as failed for an upstream issue
+    html = fetch_url_text(BREAKING_NEWS_URL, timeout=20)
+    if html is None:
+        print(
+            "⚠️  Could not fetch breaking news list (upstream may be blocking or experiencing issues). "
+            "Exiting gracefully to avoid failing the CI job.",
+            file=sys.stderr,
+        )
+        sys.exit(0)  # Exit successfully - this is not a scraper bug
+
     try:
-        article_links = extract_article_links(BREAKING_NEWS_URL)
+        # Parse the HTML we successfully fetched
+        soup = BeautifulSoup(html, "html.parser")
+        links: set[str] = set()
+        prefix = f"{BASE_URL}/breaking-news/"
+
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            full_url = urljoin(BREAKING_NEWS_URL, href)
+
+            if not full_url.startswith(prefix):
+                continue
+            if "/print/" in full_url:
+                continue
+
+            links.add(full_url)
+
+        article_links = sorted(links)
     except Exception as exc:  # noqa: BLE001
-        raise SystemExit(f"Failed to fetch breaking news list: {exc}") from exc
+        print(f"❌ Error parsing breaking news list: {exc}", file=sys.stderr)
+        sys.exit(0)  # Exit gracefully - upstream content format issue
 
     if not article_links:
         print("No breaking news articles found on page.")

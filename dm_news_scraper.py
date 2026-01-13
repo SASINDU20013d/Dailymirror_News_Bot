@@ -255,7 +255,8 @@ def save_sent_article(
 ) -> None:
     """Append a newly sent article to the in-memory store."""
 
-    now = utc_now().replace(microsecond=0).isoformat()
+    # Remove timezone info before isoformat to match old format (naive datetime + Z)
+    now = utc_now().replace(microsecond=0, tzinfo=None).isoformat() + "Z"
     store.setdefault("articles", []).append(
         {
             "url": url,

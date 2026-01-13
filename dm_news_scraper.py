@@ -214,6 +214,9 @@ def cleanup_old_articles(
         try:
             ts = sent_at_str.rstrip("Z")
             sent_at = dt.datetime.fromisoformat(ts)
+            # Ensure timezone-aware for comparison with cutoff
+            if sent_at.tzinfo is None:
+                sent_at = sent_at.replace(tzinfo=timezone.utc)
         except ValueError:
             print(
                 f"❌ Invalid sent_at timestamp '{sent_at_str}' in tracking store; keeping entry but it won't be pruned.",

@@ -3,12 +3,15 @@ import hashlib
 import json
 import os
 import sys
+from datetime import timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 BASE_URL = "https://www.dailymirror.lk"
@@ -20,18 +23,72 @@ SENT_ARTICLES_PATH = Path(__file__).with_name("sent_articles.json")
 RETENTION_DAYS = 7
 
 
-def fetch_html(url: str) -> str:
-    headers = {
+def utc_now() -> dt.datetime:
+    """Return current UTC time as a timezone-aware datetime."""
+    return dt.datetime.now(timezone.utc)
+
+
+def create_session(
+    retries: int = 3,
+    backoff_factor: float = 1.0,
+    status_forcelist: Tuple[int, ...] = (429, 500, 502, 503, 504),
+) -> requests.Session:
+    """Create a requests.Session with retries and browser-like headers."""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=status_forcelist,
+        allowed_methods=["GET", "POST"],
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    # Set browser-like headers to reduce likelihood of 403s
+    session.headers.update({
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/120.0 Safari/537.36"
         ),
         "Accept-Language": "en-US,en;q=0.9",
-    }
-    resp = requests.get(url, headers=headers, timeout=20)
-    resp.raise_for_status()
-    return resp.text
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    })
+    return session
+
+
+# Create a global session for reuse
+_session = create_session()
+
+
+def fetch_url_text(url: str, timeout: int = 15) -> str | None:
+    """Fetch URL text with timeout and error handling.
+    
+    Treats HTTP 403 as non-fatal (logs and returns None).
+    Returns None on any error to prevent script crashes.
+    """
+    try:
+        resp = _session.get(url, timeout=timeout)
+        resp.raise_for_status()
+        return resp.text
+    except requests.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 403:
+            print(f"⚠️ HTTP 403 Forbidden for {url} (upstream block/restriction). Skipping.", file=sys.stderr)
+            return None
+        print(f"❌ HTTP error fetching {url}: {exc}", file=sys.stderr)
+        return None
+    except requests.RequestException as exc:
+        print(f"❌ Network error fetching {url}: {exc}", file=sys.stderr)
+        return None
+
+
+def fetch_html(url: str) -> str:
+    """Fetch HTML content from URL (deprecated wrapper for compatibility)."""
+    result = fetch_url_text(url, timeout=20)
+    if result is None:
+        raise RuntimeError(f"Failed to fetch {url}")
+    return result
 
 
 def extract_article_links(list_url: str = BREAKING_NEWS_URL) -> List[str]:
@@ -145,7 +202,8 @@ def cleanup_old_articles(
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Remove articles older than the retention period."""
 
-    cutoff = dt.datetime.utcnow() - dt.timedelta(days=retention_days)
+    cutoff = utc_now() - dt.timedelta(days=retention_days)
+    print(f"🕒 Using UTC-aware cutoff time: {cutoff.isoformat()}")
     cleaned: List[Dict[str, Any]] = []
 
     for article in store.get("articles", []):
@@ -208,7 +266,7 @@ def save_sent_article(
 ) -> None:
     """Append a newly sent article to the in-memory store."""
 
-    now = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    now = utc_now().replace(microsecond=0).isoformat() + "Z"
     store.setdefault("articles", []).append(
         {
             "url": url,
@@ -266,6 +324,10 @@ def main(argv: List[str]) -> None:
 
     try:
         article_links = extract_article_links(BREAKING_NEWS_URL)
+    except RuntimeError as exc:
+        # fetch_url_text returned None (likely 403 or network error)
+        print(f"⚠️ {exc}. Could not fetch breaking news page (possibly blocked or transient error). Exiting gracefully.", file=sys.stderr)
+        sys.exit(0)
     except Exception as exc:  # noqa: BLE001
         raise SystemExit(f"Failed to fetch breaking news list: {exc}") from exc
 

@@ -1,0 +1,48 @@
+name: DailyMirror breaking news scraper
+
+on:
+  schedule:
+    - cron: "15 * * * *"  # every hour at minute 15
+  workflow_dispatch: {}
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run DailyMirror scraper
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python dm_news_scraper.py
+
+      - name: Commit updated sent_articles.json (if changed)
+        if: success()
+        run: |
+          if git diff --quiet -- sent_articles.json; then
+            echo "No changes in sent_articles.json"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add sent_articles.json
+            git commit -m "Update DailyMirror sent articles [skip ci]" || echo "Nothing to commit"
+          fi
+
+      - name: Push changes
+        if: success()
+        run: |
+          git push

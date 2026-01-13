@@ -117,10 +117,20 @@ def fetch_html(url: str) -> str:
     return text
 
 
-def extract_article_links(list_url: str = BREAKING_NEWS_URL) -> List[str]:
-    """Extract Daily Mirror breaking-news article URLs from the listing page."""
-
-    html = fetch_html(list_url)
+def extract_article_links(list_url: str = BREAKING_NEWS_URL, html: str | None = None) -> List[str]:
+    """
+    Extract Daily Mirror breaking-news article URLs from the listing page.
+    
+    Args:
+        list_url: URL of the breaking news listing page
+        html: Optional pre-fetched HTML content. If None, will fetch from list_url.
+    
+    Returns:
+        Sorted list of article URLs
+    """
+    if html is None:
+        html = fetch_html(list_url)
+    
     soup = BeautifulSoup(html, "html.parser")
 
     links: set[str] = set()
@@ -363,23 +373,8 @@ def main(argv: List[str]) -> None:
         sys.exit(0)  # Exit successfully - this is not a scraper bug
 
     try:
-        # Parse the HTML we successfully fetched
-        soup = BeautifulSoup(html, "html.parser")
-        links: set[str] = set()
-        prefix = f"{BASE_URL}/breaking-news/"
-
-        for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
-            full_url = urljoin(BREAKING_NEWS_URL, href)
-
-            if not full_url.startswith(prefix):
-                continue
-            if "/print/" in full_url:
-                continue
-
-            links.add(full_url)
-
-        article_links = sorted(links)
+        # Parse the HTML we successfully fetched using the existing function
+        article_links = extract_article_links(BREAKING_NEWS_URL, html=html)
     except Exception as exc:  # noqa: BLE001
         print(f"❌ Error parsing breaking news list: {exc}", file=sys.stderr)
         sys.exit(0)  # Exit gracefully - upstream content format issue

@@ -1,14 +1,16 @@
-import datetime as dt
 import hashlib
 import json
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 BASE_URL = "https://www.dailymirror.lk"
@@ -20,43 +22,85 @@ SENT_ARTICLES_PATH = Path(__file__).with_name("sent_articles.json")
 RETENTION_DAYS = 7
 
 
-def fetch_html(url: str) -> str:
-    headers = {
+def utc_now() -> datetime:
+    """Return timezone-aware current UTC datetime (Python 3.12+ compatible)."""
+    return datetime.now(timezone.utc)
+
+
+def _create_session() -> requests.Session:
+    """
+    Create a requests Session with retry logic and browser-like headers.
+    
+    Retries help with transient network issues. Browser headers reduce
+    likelihood of being blocked (403) by the remote site.
+    """
+    session = requests.Session()
+    
+    # Configure retries for transient errors (network issues, 5xx server errors)
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    # Set browser-like headers to reduce likelihood of 403s
+    session.headers.update({
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/120.0 Safari/537.36"
         ),
         "Accept-Language": "en-US,en;q=0.9",
-    }
-    resp = requests.get(url, headers=headers, timeout=20)
-    resp.raise_for_status()
-    return resp.text
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+    
+    return session
 
 
-def extract_article_links(list_url: str = BREAKING_NEWS_URL) -> List[str]:
-    """Extract Daily Mirror breaking-news article URLs from the listing page."""
+# Global session instance for reuse across requests
+_SESSION = _create_session()
 
-    html = fetch_html(list_url)
-    soup = BeautifulSoup(html, "html.parser")
 
-    links: set[str] = set()
-    # Example article URL: https://www.dailymirror.lk/breaking-news/Slug/108-330175
-    prefix = f"{BASE_URL}/breaking-news/"
+def fetch_url_text(url: str, timeout: int = 15) -> str | None:
+    """
+    Fetch URL text using the session with retries and error handling.
+    
+    Treats 403 Forbidden as non-fatal (logs and returns None) to avoid
+    failing the entire job when the remote site blocks requests.
+    
+    Returns None on any request failure to keep the script resilient.
+    """
+    try:
+        resp = _SESSION.get(url, timeout=timeout)
+        resp.raise_for_status()
+        return resp.text
+    except requests.exceptions.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 403:
+            # 403 Forbidden is non-fatal; remote site may be blocking us temporarily
+            print(
+                f"⚠️  Received 403 Forbidden from {url}. Remote site may be blocking requests.",
+                file=sys.stderr,
+            )
+            return None
+        # Other HTTP errors are also non-fatal; log and return None
+        print(f"❌ HTTP error fetching {url}: {exc}", file=sys.stderr)
+        return None
+    except requests.exceptions.RequestException as exc:
+        # Network errors, timeouts, etc. are non-fatal
+        print(f"❌ Request error fetching {url}: {exc}", file=sys.stderr)
+        return None
 
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        full_url = urljoin(list_url, href)
 
-        if not full_url.startswith(prefix):
-            continue
-        # Skip print or other non-standard variants
-        if "/print/" in full_url:
-            continue
-
-        links.add(full_url)
-
-    return sorted(links)
+def fetch_html(url: str) -> str:
+    """Legacy wrapper that raises on failure (kept for compatibility)."""
+    text = fetch_url_text(url, timeout=20)
+    if text is None:
+        raise RuntimeError(f"Failed to fetch {url}")
+    return text
 
 
 def extract_article_content(article_url: str) -> Tuple[str, str]:
@@ -145,7 +189,7 @@ def cleanup_old_articles(
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Remove articles older than the retention period."""
 
-    cutoff = dt.datetime.utcnow() - dt.timedelta(days=retention_days)
+    cutoff = utc_now() - timedelta(days=retention_days)
     cleaned: List[Dict[str, Any]] = []
 
     for article in store.get("articles", []):
@@ -155,7 +199,10 @@ def cleanup_old_articles(
             continue
         try:
             ts = sent_at_str.rstrip("Z")
-            sent_at = dt.datetime.fromisoformat(ts)
+            sent_at = datetime.fromisoformat(ts)
+            # Make timezone-aware if not already
+            if sent_at.tzinfo is None:
+                sent_at = sent_at.replace(tzinfo=timezone.utc)
         except ValueError:
             print(
                 f"❌ Invalid sent_at timestamp '{sent_at_str}' in tracking store; keeping entry but it won't be pruned.",
@@ -208,7 +255,7 @@ def save_sent_article(
 ) -> None:
     """Append a newly sent article to the in-memory store."""
 
-    now = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    now = utc_now().replace(microsecond=0).isoformat()
     store.setdefault("articles", []).append(
         {
             "url": url,
@@ -264,10 +311,41 @@ def main(argv: List[str]) -> None:
     print(f"📊 Currently tracking {tracked_count} articles from last {RETENTION_DAYS} days")
     print(f"🔍 Fetching breaking news list: {BREAKING_NEWS_URL}")
 
+    # Fetch breaking news list with non-fatal error handling
+    # If fetch fails (e.g., 403 or network error), exit gracefully with code 0
+    # so the GitHub Actions job doesn't fail for upstream issues.
+    html = fetch_url_text(BREAKING_NEWS_URL, timeout=20)
+    if html is None:
+        print(
+            "⚠️  Could not fetch breaking news list (likely upstream 403 or network error).",
+            file=sys.stderr,
+        )
+        print("Exiting with success (code 0) to avoid failing the Actions job for upstream issues.")
+        sys.exit(0)
+
     try:
-        article_links = extract_article_links(BREAKING_NEWS_URL)
+        # Parse the HTML to extract article links
+        soup = BeautifulSoup(html, "html.parser")
+        links: set[str] = set()
+        prefix = f"{BASE_URL}/breaking-news/"
+
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            full_url = urljoin(BREAKING_NEWS_URL, href)
+
+            if not full_url.startswith(prefix):
+                continue
+            # Skip print or other non-standard variants
+            if "/print/" in full_url:
+                continue
+
+            links.add(full_url)
+
+        article_links = sorted(links)
     except Exception as exc:  # noqa: BLE001
-        raise SystemExit(f"Failed to fetch breaking news list: {exc}") from exc
+        print(f"❌ Error parsing breaking news list: {exc}", file=sys.stderr)
+        print("Exiting with success (code 0) to avoid failing the Actions job.")
+        sys.exit(0)
 
     if not article_links:
         print("No breaking news articles found on page.")

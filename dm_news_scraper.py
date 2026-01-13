@@ -97,16 +97,8 @@ def fetch_url_text(url: str, timeout: int = 15) -> str | None:
 
 
 def fetch_html(url: str) -> str:
-    """Legacy wrapper that raises on error (for backwards compatibility in article fetching)."""
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    resp = requests.get(url, headers=headers, timeout=20)
+    """Fetch HTML with retry logic, raising on error (for backwards compatibility in article fetching)."""
+    resp = _session.get(url, timeout=20)
     resp.raise_for_status()
     return resp.text
 
@@ -327,7 +319,7 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> None:
         "parse_mode": "HTML",
         "disable_web_page_preview": False,
     }
-    resp = requests.post(api_url, json=payload, timeout=20)
+    resp = _session.post(api_url, json=payload, timeout=20)
     try:
         resp.raise_for_status()
     except requests.HTTPError as exc:

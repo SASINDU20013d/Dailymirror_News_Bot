@@ -1,14 +1,16 @@
-import datetime as dt
 import hashlib
 import json
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 BASE_URL = "https://www.dailymirror.lk"
@@ -20,7 +22,82 @@ SENT_ARTICLES_PATH = Path(__file__).with_name("sent_articles.json")
 RETENTION_DAYS = 7
 
 
+def utc_now() -> datetime:
+    """Return timezone-aware current UTC datetime (Python 3.12 compatible)."""
+    return datetime.now(timezone.utc)
+
+
+def create_session(
+    retries: int = 3,
+    backoff_factor: float = 1.0,
+    status_forcelist: Tuple[int, ...] = (429, 500, 502, 503, 504),
+) -> requests.Session:
+    """
+    Create a requests.Session with retry logic and browser-like headers.
+    
+    This helps reduce upstream 403s and handle transient network errors.
+    """
+    session = requests.Session()
+    
+    retry_strategy = Retry(
+        total=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=status_forcelist,
+        allowed_methods=["GET", "POST"],
+    )
+    
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    # Browser-like headers to reduce likelihood of 403 blocks
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+    
+    return session
+
+
+# Global session instance for reuse across requests
+_session = create_session()
+
+
+def fetch_url_text(url: str, timeout: int = 15) -> str | None:
+    """
+    Fetch URL text content with robust error handling.
+    
+    - Treats HTTP 403 as non-fatal (logs and returns None) to avoid script crashes
+      when upstream site blocks us.
+    - Uses retries configured in the session.
+    - Returns None on any error instead of raising, keeping the script resilient.
+    
+    Returns:
+        Response text on success, None on any error.
+    """
+    try:
+        resp = _session.get(url, timeout=timeout)
+        
+        # Treat 403 (Forbidden) as non-fatal - upstream may be blocking us temporarily
+        if resp.status_code == 403:
+            print(f"⚠️  Received HTTP 403 (Forbidden) from {url}. Upstream may be blocking requests.", file=sys.stderr)
+            return None
+        
+        resp.raise_for_status()
+        return resp.text
+        
+    except requests.RequestException as exc:
+        print(f"❌ Network error fetching {url}: {exc}", file=sys.stderr)
+        return None
+
+
 def fetch_html(url: str) -> str:
+    """Legacy wrapper that raises on error (for backwards compatibility in article fetching)."""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -34,10 +111,17 @@ def fetch_html(url: str) -> str:
     return resp.text
 
 
-def extract_article_links(list_url: str = BREAKING_NEWS_URL) -> List[str]:
-    """Extract Daily Mirror breaking-news article URLs from the listing page."""
-
-    html = fetch_html(list_url)
+def extract_article_links(list_url: str = BREAKING_NEWS_URL) -> List[str] | None:
+    """
+    Extract Daily Mirror breaking-news article URLs from the listing page.
+    
+    Returns:
+        List of article URLs on success, None if fetch fails.
+    """
+    html = fetch_url_text(list_url, timeout=20)
+    if html is None:
+        return None
+    
     soup = BeautifulSoup(html, "html.parser")
 
     links: set[str] = set()
@@ -145,7 +229,8 @@ def cleanup_old_articles(
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Remove articles older than the retention period."""
 
-    cutoff = dt.datetime.utcnow() - dt.timedelta(days=retention_days)
+    cutoff = utc_now() - timedelta(days=retention_days)
+    print(f"🕐 Using UTC-aware cutoff time: {cutoff.isoformat()}")
     cleaned: List[Dict[str, Any]] = []
 
     for article in store.get("articles", []):
@@ -155,7 +240,10 @@ def cleanup_old_articles(
             continue
         try:
             ts = sent_at_str.rstrip("Z")
-            sent_at = dt.datetime.fromisoformat(ts)
+            sent_at = datetime.fromisoformat(ts)
+            # Make timezone-aware if naive
+            if sent_at.tzinfo is None:
+                sent_at = sent_at.replace(tzinfo=timezone.utc)
         except ValueError:
             print(
                 f"❌ Invalid sent_at timestamp '{sent_at_str}' in tracking store; keeping entry but it won't be pruned.",
@@ -208,7 +296,7 @@ def save_sent_article(
 ) -> None:
     """Append a newly sent article to the in-memory store."""
 
-    now = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    now = utc_now().replace(microsecond=0).isoformat() + "Z"
     store.setdefault("articles", []).append(
         {
             "url": url,
@@ -264,10 +352,17 @@ def main(argv: List[str]) -> None:
     print(f"📊 Currently tracking {tracked_count} articles from last {RETENTION_DAYS} days")
     print(f"🔍 Fetching breaking news list: {BREAKING_NEWS_URL}")
 
-    try:
-        article_links = extract_article_links(BREAKING_NEWS_URL)
-    except Exception as exc:  # noqa: BLE001
-        raise SystemExit(f"Failed to fetch breaking news list: {exc}") from exc
+    # Fetch breaking news list with robust error handling
+    # If fetch fails (e.g., 403 or network error), exit gracefully with code 0
+    # to avoid failing the GitHub Actions job for upstream issues
+    article_links = extract_article_links(BREAKING_NEWS_URL)
+    
+    if article_links is None:
+        # Fetch failed - this could be a 403, timeout, or other network issue
+        # Exit with code 0 (success) to skip this run without failing the workflow
+        print("⚠️  Failed to fetch breaking news list. Skipping this run to avoid workflow failure.", file=sys.stderr)
+        print("💡 Rationale: Upstream site may be blocking requests or having issues. Will retry on next scheduled run.", file=sys.stderr)
+        sys.exit(0)
 
     if not article_links:
         print("No breaking news articles found on page.")

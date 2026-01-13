@@ -287,7 +287,7 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> None:
         "parse_mode": "HTML",
         "disable_web_page_preview": False,
     }
-    resp = requests.post(api_url, json=payload, timeout=20)
+    resp = _SESSION.post(api_url, json=payload, timeout=20)
     try:
         resp.raise_for_status()
     except requests.HTTPError as exc:

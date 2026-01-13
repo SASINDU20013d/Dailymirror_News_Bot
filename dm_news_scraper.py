@@ -145,7 +145,7 @@ def cleanup_old_articles(
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Remove articles older than the retention period."""
 
-    cutoff = dt.datetime.utcnow() - dt.timedelta(days=retention_days)
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=retention_days)
     cleaned: List[Dict[str, Any]] = []
 
     for article in store.get("articles", []):
@@ -208,7 +208,7 @@ def save_sent_article(
 ) -> None:
     """Append a newly sent article to the in-memory store."""
 
-    now = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat() + "Z"
     store.setdefault("articles", []).append(
         {
             "url": url,
